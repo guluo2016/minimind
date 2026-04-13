@@ -1,6 +1,38 @@
 from torch import nn
 import torch
 
+# 构建一个余弦/正弦位置编码函数
+def build_rotary_pos_emb(dim, max_token=32768, rope_base=1000000.0):
+    # 构建一个从0开始，步骤为2, 直至dim的张量，并将其转换为浮点数类型  [0, 2, 4, ..., dim-2]，长度为dim//2  (dim // 2) 是为了防止dim是奇数的情况，保证最后一个位置不会越界
+    base_a = torch.arange(0, dim, 2)[: (dim // 2)].float()
+    
+    # 归一化处理，等比例缩小到[0, 1]
+    base_a = base_a / dim
+    
+    # rope_base专业术语叫做旋转位置编码的基数，它是一个超参数，通常设置为一个较大的值，例如1000000.0
+    # 使得张量中的值，不同位置之间产生指数级差异
+    base_a = rope_base ** base_a
+
+    # 在这之前是从1到大的排列，但是我们需要从大到小的排列，因为RoPE要求的是前排位置的频率较大，后排位置的频率较小，所以我们需要将base_a进行倒数处理
+    freqs = 1.0 / (rope_base ** base_a)
+
+    # 生成一个从0到end的整数序列，长度为end，并将其放置在与freqs相同的设备上，以确保后续的计算能够在同一设备上进行
+    t = torch.arange(max_token, device=freqs.device)
+
+    # 外积计算，把张量t中的每个元素与freqs中的每个元素相乘，得到一个[end, dim//2]
+    # [end, dim//2] 中的每一行表示对应位置的绝对角度，每行会有多个值，分别表示改位置向量中不同维度的旋转频率
+    # 举例说明，假设我们需要计算3个token的位置编码，freqs只有两个转速： t = [0, 1, 2], freqs = [1.0, 0.1],
+    # 那么外积的结果就是 [[0.0, 0.0], [1.0, 0.1], [2.0, 0.2]]，第一行表示token在绝对位置0时的不同维度的角度，第二行表示token在绝对位置1时的不同维度的角度，第三行表示token在绝对位置2时的不同维度的角度
+    freqs = torch.outer(t, freqs)
+
+    # 知道角度不是目的，我们实际上是通过正弦和余弦函数来将这些角度转换为位置编码向量的不同维度的值
+    torch.cos(freqs)
+    attn_factor = 1.0
+    freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1) * attn_factor
+    freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1) * attn_factor
+    return freqs_cos, freqs_sin
+
+
 def apply_rotary_pos_emb(x, seq_len=None):
     # 这里是一个位置编码函数，使用了旋转位置编码（Rotary Position Embedding, RoPE）的方式来为输入的张量添加位置信息
     # 旋转位置编码是一种相对于传统位置编码更为灵活和高效的位置编码方法，它通过对输入的特征向量进行旋转变换来引入位置信息
@@ -57,11 +89,6 @@ class Attention(nn.Module):
         # 如果没有位置信息的话，对于语句 “我吃苹果” 和 “苹果吃我”，模型就无法区分他们的差异，将其当作同一句话来处理了
         x_q = apply_rotary_pos_emb(x_q, seq_len=seq_len)
         x_k = apply_rotary_pos_emb(x_k, seq_len=seq_len)
-
-
-
-
-
 
 
 # 我想定义一个Decoder only架构的Block层
