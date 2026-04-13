@@ -105,10 +105,27 @@ class GuluoBlock(nn.Module):
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.mlp = FeedForward(config) if not config.use_moe else MOEFeedForward(config)
+        freqs_cos, freqs_sin = build_rotary_pos_emb(self.head_dim, max_token=config.max_position_embeddings)
 
 class GuluoModel(nn.Module):
     def __init__(self):
         super().__init__()
         
-    def forward(self, x):
-        pass
+    def forward(self, inputs_ids: Optional[torch.Tensor] = None,
+                past_key_values=None):
+        # past_key_values用于进行K V向量的缓存，这里规定模型设置了多少层，就会有多少个缓存位置，每个位置存储一个有关KV信息的二元组
+        # past_key_values是一个列表，里面中有模型层数个元素，每个元素是一个二元组，代表第i层的KV缓存信息
+        # 每个二元组是两个张量构成的，分别表示这一层的K向量和V向量的缓存信息，K向量和V向量的形状都是[batch_size, sequence_length, num_heads, head_dim]
+        # 其中batch_size表示批次大小，已经缓存的token数量 num_heads表示注意力头数，head_dim表示每个头的维度
+        # 哪一层为None，代表这一层没有缓存信息
+        # 在模型训练阶段，不需要进行KV缓存，因此默认情况下 past_key_values是None，在模型推理阶段，past_key_values会被传入具体的KV缓存信息，以便模型能够利用之前的计算结果来加速推理过程
+        past_key_values = past_key_values if past_key_values is not None else [None] * len(self.layers)
+        # 在模型训练阶段，初始情况下，star_pos是0
+        star_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
+
+        # 获取当前输入的tokens序列长度
+        seq_len = inputs_ids.shape[1]
+        end_pos = star_pos + seq_len
+
+        # 计算位置编码
+        position_embeddings = (self.freqs_cos[star_pos: end_pos, :], self.freqs_sin[star_pos: end_pos, :])
