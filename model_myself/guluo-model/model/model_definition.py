@@ -33,12 +33,51 @@ def build_rotary_pos_emb(dim, max_token=32768, rope_base=1000000.0):
     return freqs_cos, freqs_sin
 
 
-def apply_rotary_pos_emb(x, seq_len=None):
+def apply_rotary_pos_emb(t, cos, sin, seq_len=None):
     # 这里是一个位置编码函数，使用了旋转位置编码（Rotary Position Embedding, RoPE）的方式来为输入的张量添加位置信息
     # 旋转位置编码是一种相对于传统位置编码更为灵活和高效的位置编码方法，它通过对输入的特征向量进行旋转变换来引入位置信息
     # 具体来说，RoPE会将输入的特征向量分成两部分，一部分用于表示内容信息，另一部分用于表示位置信息，然后通过旋转变换将位置信息融入到内容信息中
     # 这样做的好处是可以在不同长度的序列上共享位置编码，同时也能够更好地捕捉长距离依赖关系
-    return x
+
+    def rotate_half(x):
+        # 将指定张量切分成两部分，前一部分数据不变，后一部分全部取反
+        # 并将重新将两部分数据拼接成一个张量，但是后者在前，前者在后
+        """
+        为什么折半截断，而不是两两组合？
+        主要是为了方便显卡读取数据时的连续性，如果相邻两个特征组合，会导致CPU在计算的时候，计算完a0 a1 后，需要跳过a2 a3，才能计算a4 a5，这样就会导致CPU在读取数据的时候，无法连续读取，效率较低
+        但是如果折半截断，显卡拿到的是两块连续的数据，交给GPU处理的时候，GPU在处理两部分数据的时候，可以连续读取，效率较高
+        """
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = -x[..., x.shape[-1] // 2 :]
+        """
+        为什么要这么做？
+        张量X可以看作是： [a1, a2], 其中a1表示前半部分，a2表示后半部分
+
+        """
+        new_x = torch.cat([x2, x1], dim=-1)
+        return new_x
+    
+    """
+    为什么要这么做？
+    t可以看作是[a1, a2]，其中a1表示前半部分，a2表示后半部分
+    因此下面的式子可以看作是： [a1, a2] * cos + [-a2, a1] * sin = [a1*cos - a2*sin, a1*sin + a2*cos] 
+    这是一个二维向量的旋转公式： [ [cos, -sin], [sin, cos]] * [a1, a2]^T 表示原向量t相对于绝对位置旋转了一个角度
+
+    这里还有另外一个问题，为什么cos和sin要进行unsqueeze(1) 操作？
+    - 目标张量 t 的 shape:   [batch, seq_len, num_attention_heads, head_dim]
+    - 原始 cos/sin 的 shape: [seq_len, head_dim]
+   
+    执行 unsqueeze(1) 后，cos/sin 变为 [seq_len, 1, head_dim]。
+    利用 PyTorch 从右向左的广播机制：
+    t:   [batch, seq_len, num_heads, head_dim]
+    cos: [   1 , seq_len,         1, head_dim] (最左侧的 1 是隐式补全)
+   
+    结论：  unsqueeze(1) 的核心目的是在 num_attention_heads 维度上占位。
+            因为同一个 token 在不同 Head 下的位置编码（旋转角度）是完全一致的，
+            这样操作可以把这份位置信息正确且零成本地广播给所有的 Attention Heads。
+    """
+    t_embed = (t * cos.unsqueeze(1)) + (rotate_half(t) * sin.unsqueeze(1))
+    return t_embed
 
 
 class Attention(nn.Module):
@@ -110,6 +149,8 @@ class GuluoBlock(nn.Module):
 class GuluoModel(nn.Module):
     def __init__(self):
         super().__init__()
+        self.embed_tokens = nn.Embedding(6400, 512)
+        self.dropout = nn.Dropout(0.0)
         
     def forward(self, inputs_ids: Optional[torch.Tensor] = None,
                 past_key_values=None):
@@ -122,6 +163,8 @@ class GuluoModel(nn.Module):
         past_key_values = past_key_values if past_key_values is not None else [None] * len(self.layers)
         # 在模型训练阶段，初始情况下，star_pos是0
         star_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
+
+        hiden_states = self.dropout(self.embed_tokens(inputs_ids))
 
         # 获取当前输入的tokens序列长度
         seq_len = inputs_ids.shape[1]
